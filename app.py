@@ -1,211 +1,204 @@
+import csv
+import io
+from typing import List
+
+import instructor
 import streamlit as st
-from openai import OpenAI
 from dotenv import dotenv_values
-import time
-from deep_translator import GoogleTranslator
-
-env = dotenv_values('.env')
-
-if 'openai_api_key' not in st.session_state:
-    st.session_state['openai_api_key'] = ''
-
-with st.sidebar:
-    st.header("Ustawienia API")
-    st.session_state['openai_api_key'] = st.text_input(
-        "Podaj swój OpenAI API Key:",
-        type="password",
-        value=st.session_state['openai_api_key']
-    )
-
-# Try to use user-provided key first, fallback to .env
-openai_api_key = st.session_state['openai_api_key'] or dotenv_values('.env').get('OPENAI_API_KEY')
-if openai_api_key:
-    openai_client = OpenAI(api_key=openai_api_key)
-else:
-    openai_client = None
+from openai import OpenAI
+from pydantic import BaseModel, Field
 
 
-
-
-try:
-    openai_client = OpenAI(api_key=env['OPENAI_API_KEY'])
-except KeyError:
-    openai_client = None
-
-# Lista obsługiwanych języków
+MODEL = "gpt-4o"
 LANGUAGES = {
-    "Angielski": "en",
-    "Hiszpański": "es",
-    "Niemiecki": "de",
-    "Francuski": "fr",
-    "Włoski": "it",
-    "Portugalski (brazylijski)": "pt",
-    "Rosyjski": "ru",
-    "Chiński (mandaryński)": "zh",
-    "Japoński": "ja",
-    "Arabski": "ar",
-    "Polski": "pl",
-    "Turecki": "tr",
-    "Koreański": "ko",
-    "Hindi": "hi",
-    "Indonezyjski": "id",
-    "Niderlandzki": "nl",
-    "Herbajski": "he",
-    "Grecki": "el",
-    "Aramejski": "arc",
-    "Czeski": "cs",
-    "Szwedzki": "sv",
-    "Norweski": "no",
-    "Duński": "da",
-    "Ukraiński": "uk"
+    "Angielski": "en", "Hiszpański": "es", "Niemiecki": "de",
+    "Francuski": "fr", "Włoski": "it", "Portugalski (brazylijski)": "pt",
+    "Rosyjski": "ru", "Chiński (mandaryński)": "zh", "Japoński": "ja",
+    "Arabski": "ar", "Polski": "pl", "Turecki": "tr", "Koreański": "ko",
+    "Hindi": "hi", "Indonezyjski": "id", "Niderlandzki": "nl",
+    "Hebrajski": "he", "Grecki": "el", "Aramejski": "arc",
+    "Czeski": "cs", "Szwedzki": "sv", "Norweski": "no", "Duński": "da",
+    "Ukraiński": "uk",
 }
 
 
-# ====================================================MAIN APP=====================================================================
-# =================================================================================================================================
+class VocabularyItem(BaseModel):
+    word: str = Field(description="Pojedyncze słowo lub krótki, często używany zwrot w języku docelowym")
+    meaning_pl: str = Field(description="Polskie znaczenie")
+    example: str = Field(description="Krótkie, naturalne zdanie z tym słowem w języku docelowym")
+    example_pl: str = Field(description="Polskie tłumaczenie zdania przykładowego")
+
+
+class GrammarTip(BaseModel):
+    title: str = Field(description="Krótka nazwa konstrukcji gramatycznej")
+    explanation_pl: str = Field(description="Przystępne wyjaśnienie po polsku")
+    example: str = Field(description="Przykład użycia w języku docelowym")
+    example_pl: str = Field(description="Polskie tłumaczenie przykładu")
+
+
+class LearningPack(BaseModel):
+    vocabulary: List[VocabularyItem] = Field(description="Dokładnie 5 przydatnych i interesujących haseł")
+    grammar_tips: List[GrammarTip] = Field(description="Kilka praktycznych wskazówek gramatycznych")
+
+
+def get_clients(api_key: str):
+    if not api_key:
+        raise ValueError("Podaj klucz API OpenAI w panelu bocznym lub w pliku .env.")
+    client = OpenAI(api_key=api_key)
+    return client, instructor.from_openai(client)
+
+
+def generate_learning_pack(structured_client, language: str) -> LearningPack:
+    return structured_client.chat.completions.create(
+        model=MODEL,
+        response_model=LearningPack,
+        temperature=0.8,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Jesteś nauczycielem języka. Przygotuj materiał dla polskiego ucznia. "
+                    "Zwróć dokładnie 5 ciekawych, praktycznych słów lub krótkich zwrotów "
+                    "wskazanego języka wraz ze znaczeniem po polsku i naturalnym przykładem. "
+                    "Dodaj 3 krótkie, przydatne wskazówki gramatyczne. Wszystkie objaśnienia "
+                    "i polskie tłumaczenia napisz po polsku; przykłady podaj w języku docelowym."
+                ),
+            },
+            {"role": "user", "content": f"Język docelowy: {language}."},
+        ],
+    )
+
+
+def translate_with_gpt(client, text: str, target_language: str) -> str:
+    response = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": f"Przetłumacz tekst na język: {target_language}. Zachowaj sens i styl. Zwróć wyłącznie tłumaczenie."},
+            {"role": "user", "content": text},
+        ],
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def correct_with_gpt(client, text: str, source_language: str) -> str:
+    response = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": f"Popraw błędy ortograficzne, gramatyczne i interpunkcyjne w tekście po {source_language}. Zwróć wyłącznie poprawiony tekst."},
+            {"role": "user", "content": text},
+        ],
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def translations_csv(rows) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(["Język", "Tekst źródłowy", "Tłumaczenie"])
+    writer.writerows((row["language"], row["source"], row["translation"]) for row in rows)
+    return ("\ufeff" + buffer.getvalue()).encode("utf-8")
+
 
 st.set_page_config(page_title="Language assistant", layout="wide")
+st.title("Pomocnik językowy | Language assistant")
+st.write("Tłumacz teksty, poprawiaj błędy i poznawaj nowe słownictwo oraz gramatykę.")
 
-st.title('Pomocnik językowy   |   Language assistant')
-st.markdown('Tłumaczenie tekstów na 22 popularne języki + hebrajski, aramejski, grecki')
+if "openai_api_key" not in st.session_state:
+    st.session_state.openai_api_key = ""
+if "translations" not in st.session_state:
+    st.session_state.translations = []
 
-# ==================== TAB 1: TRANSLATOR (GoogleTranslator) ====================
-def translate_with_google(text: str, target_lang_code: str) -> str:
-    """Translate Polish text to target language using GoogleTranslator."""
-    try:
-        return GoogleTranslator(source="pl", target=target_lang_code).translate(text)
-    except Exception as e:
-        return f"❌ Błąd tłumaczenia: {str(e)}"
+with st.sidebar:
+    st.header("Ustawienia API")
+    st.session_state.openai_api_key = st.text_input(
+        "Podaj swój OpenAI API Key:", type="password", value=st.session_state.openai_api_key
+    )
 
+api_key = st.session_state.openai_api_key or dotenv_values(".env").get("OPENAI_API_KEY", "")
+languages = list(LANGUAGES)
+tab_learn, tab_translate, tab_correct = st.tabs(["Słówka i gramatyka", "Tłumacz", "Popraw tekst"])
 
-# ====================== tab3  tlumaczenie
+with tab_learn:
+    language = st.selectbox("Wybierz język docelowy:", languages, key="learning_language")
+    if st.button("Wygeneruj wyjaśnienia słów i gramatyki", key="generate_learning"):
+        try:
+            _, structured_client = get_clients(api_key)
+            with st.spinner("Przygotowuję słówka i wskazówki gramatyczne..."):
+                pack = generate_learning_pack(structured_client, language)
+            if len(pack.vocabulary) != 5:
+                raise ValueError("Model nie zwrócił dokładnie 5 haseł. Spróbuj ponownie.")
+            st.session_state.learning_pack = pack
+            st.session_state.learning_language = language
+        except Exception as exc:
+            st.error(f"Nie udało się wygenerować materiału: {exc}")
 
-def correct_foreign_text_with_gpt(text: str, source_lang: str) -> str:
-    """Correct spelling and grammar mistakes in a foreign-language text."""
-    if not openai_client:
-        return "❌ Błąd: Brak klucza API OpenAI. Sprawdź plik .env"
+    pack = st.session_state.get("learning_pack")
+    if pack:
+        st.subheader(f"Słówka: {st.session_state.learning_language}")
+        for item in pack.vocabulary:
+            with st.container(border=True):
+                st.markdown(f"**{item.word}** — {item.meaning_pl}")
+                st.markdown(f"*{item.example}*  \n{item.example_pl}")
+        st.subheader("Wskazówki gramatyczne")
+        for tip in pack.grammar_tips:
+            with st.container(border=True):
+                st.markdown(f"**{tip.title}**")
+                st.write(tip.explanation_pl)
+                st.markdown(f"*{tip.example}*  \n{tip.example_pl}")
 
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"Jesteś korektorem tekstów napisanych po {source_lang}. Popraw błędy ortograficzne, gramatyczne i interpunkcyjne. Zwróć tylko poprawioną wersję tekstu, bez dodatkowych komentarzy."
-                },
-                {
-                    "role": "user",
-                    "content": text
-                }
-            ],
-            temperature=0.2
+with tab_translate:
+    target_language = st.selectbox("Tłumacz na:", languages, key="translation_language")
+    source_text = st.text_area("Wpisz tekst do tłumaczenia:", key="translation_input", height=160)
+    if st.button("Tłumacz", key="translate_button"):
+        if not source_text.strip():
+            st.warning("Wpisz tekst do tłumaczenia.")
+        else:
+            try:
+                client, _ = get_clients(api_key)
+                with st.spinner("Tłumaczę..."):
+                    translated = translate_with_gpt(client, source_text.strip(), target_language)
+                st.session_state.translations.append({
+                    "source": source_text.strip(), "translation": translated, "language": target_language
+                })
+                st.success("Tłumaczenie gotowe.")
+            except Exception as exc:
+                st.error(f"Nie udało się przetłumaczyć tekstu: {exc}")
+
+    if st.session_state.translations:
+        st.subheader("Historia tłumaczeń")
+        for row in reversed(st.session_state.translations):
+            with st.container(border=True):
+                st.markdown(f"**Tekst:** {row['source']}")
+                st.markdown(f"**{row['language']}:** {row['translation']}")
+        st.download_button(
+            "Pobierz tłumaczenia (CSV)",
+            data=translations_csv(st.session_state.translations),
+            file_name="tlumaczenia.csv",
+            mime="text/csv; charset=utf-8",
         )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ Błąd API: {str(e)}"
 
-
-def translate_to_polish_with_google(text: str, source_lang_code: str) -> str:
-    """Translate text from a foreign language to Polish using GoogleTranslator."""
-    try:
-        return GoogleTranslator(source=source_lang_code, target="pl").translate(text)
-    except Exception as e:
-        return f"❌ Błąd tłumaczenia: {str(e)}"
-
-# ==================== GOOGLE TRANSLATOR ====================
-st.header("📝 Tłumaczenie translatorem")
-st.write("Szybkie tłumaczenie z polskiego na wybrany język")
-
-if "tab1_translations" not in st.session_state:
-    st.session_state.tab1_translations = []
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    target_language_tab1 = st.selectbox(
-        "Wybierz język docelowy:",
-        options=list(LANGUAGES.keys()),
-        key="tab1_language",
-        index=None
-    )
-with col2:
-    st.write("")
-    st.write("")
-    st.info(f"🎯 {target_language_tab1}")
-
-col1, col2 = st.columns([4, 1])
-with col1:
-    polish_text_tab1 = st.text_input(
-        "Wpisz tekst po polsku:",
-        placeholder="np. Wpisz tekst w języku do przetłumaczenia.",
-        key="tab1_input"
-    )
-with col2:
-    st.write("")
-    st.write("")
-    translate_btn_tab1 = st.button("Tłumacz", key="tab1_button", use_container_width=True)
-
-if translate_btn_tab1:
-    if not polish_text_tab1.strip():
-        st.warning("⚠️ Proszę wpisać tekst po polsku")
-    else:
-        target_lang_code = LANGUAGES[target_language_tab1]
-        translated = translate_with_google(polish_text_tab1, target_lang_code)
-        st.session_state.tab1_translations.append({
-            "source": polish_text_tab1,
-            "target": translated,
-            "language": target_language_tab1
-        })
-        st.success("✅ Tekst przetłumaczony!")
-
-if st.session_state.tab1_translations:
-    st.subheader("📚 Historia tłumaczeń")
-    for translation in reversed(st.session_state.tab1_translations):
-        with st.container(border=True):
-            st.markdown(f"**PL:** {translation['source']}")
-            st.markdown(f"**{translation['language']}:** {translation['target']}")
-
-st.divider()
-
-# ==================== ERROR CORRECTION ====================
-st.header("🛠️ Poprawianie błędów w tekście obcym")
-st.write("Wpisz tekst w wybranym języku obcym, popraw błędy i zobacz tłumaczenie na polski")
-
-if "tab3_corrected_text" not in st.session_state:
-    st.session_state.tab3_corrected_text = ""
-if "tab3_translation" not in st.session_state:
-    st.session_state.tab3_translation = ""
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    source_language_tab3 = st.selectbox(
-        "Wybierz język tekstu:",
-        options=list(LANGUAGES.keys()),
-        key="tab3_language",
-        index=None
-    )
-with col2:
-    st.write("")
-    st.write("")
-    st.info(f"🎯 {source_language_tab3}")
-
-foreign_text_tab3 = st.text_area(
-    "Wpisz tekst z błędami:",
-    placeholder="np. Hallo, wie geit es dir?",
-    key="tab3_input",
-    height=220
-)
-
-if st.button("Popraw błędy", key="tab3_correct_button", use_container_width=True):
-    if not foreign_text_tab3.strip():
-        st.warning("⚠️ Proszę wpisać tekst do poprawy")
-    elif not source_language_tab3:
-        st.warning("⚠️ Proszę wybrać język tekstu")
-    else:
-        corrected_text = correct_foreign_text_with_gpt(foreign_text_tab3, source_language_tab3)
-        st.session_state.tab3_corrected_text = corrected_text
-        st.session_state.tab3_translation = ""
-        st.success("✅ Tekst poprawiony!")
-
-if st.session_state.tab3_corrected_text:
-    st.subheader("✍️ Poprawiona wersja")
-    st.write(st.session_state.tab3_corrected_text)
+with tab_correct:
+    source_language = st.selectbox("Język tekstu:", languages, key="correction_language")
+    text_to_correct = st.text_area("Wpisz tekst do poprawy:", key="correction_input", height=220)
+    if st.button("Popraw błędy i przetłumacz na polski", key="correct_button"):
+        if not text_to_correct.strip():
+            st.warning("Wpisz tekst do poprawy.")
+        else:
+            try:
+                client, _ = get_clients(api_key)
+                with st.spinner("Poprawiam tekst..."):
+                    corrected = correct_with_gpt(client, text_to_correct.strip(), source_language)
+                st.session_state.corrected_text = corrected
+                with st.spinner("Tłumaczę poprawiony tekst na polski..."):
+                    st.session_state.corrected_translation = translate_with_gpt(
+                        client, corrected, "polski"
+                    )
+            except Exception as exc:
+                st.error(f"Nie udało się poprawić tekstu: {exc}")
+    if st.session_state.get("corrected_text"):
+        st.subheader("Poprawiony tekst")
+        st.write(st.session_state.corrected_text)
+        st.subheader("Tłumaczenie na polski")
+        st.write(st.session_state.get("corrected_translation", ""))
