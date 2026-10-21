@@ -41,6 +41,17 @@ class LearningPack(BaseModel):
     grammar_tips: List[GrammarTip] = Field(description="Kilka praktycznych wskazówek gramatycznych")
 
 
+class GrammarConstruction(BaseModel):
+    fragment: str = Field(description="Dokładny fragment tłumaczenia ilustrujący konstrukcję")
+    name: str = Field(description="Krótka nazwa konstrukcji gramatycznej")
+    explanation_pl: str = Field(description="Jasne wyjaśnienie po polsku, jak działa konstrukcja w tym zdaniu")
+
+
+class TranslationGrammarExplanation(BaseModel):
+    overview_pl: str = Field(description="Krótki opis najważniejszych cech gramatycznych tłumaczenia")
+    constructions: List[GrammarConstruction] = Field(description="Konstrukcje rzeczywiście użyte w tłumaczeniu")
+
+
 def get_clients(api_key: str):
     if not api_key:
         raise ValueError("Podaj klucz API OpenAI w panelu bocznym lub w pliku .env.")
@@ -69,6 +80,35 @@ def generate_learning_pack(structured_client, language: str) -> LearningPack:
     )
 
 
+def explain_translation_grammar(structured_client, source_text: str, translated_text: str, target_language: str) -> TranslationGrammarExplanation:
+    return structured_client.chat.completions.create(
+        model=MODEL,
+        response_model=TranslationGrammarExplanation,
+        temperature=0.2,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Jesteś nauczycielem gramatyki języka obcego. Wyjaśnij po polsku konstrukcje "
+                    "gramatyczne faktycznie użyte w podanym tłumaczeniu. Przeanalizuj każde zdanie "
+                    "osobno. Wskaż dokładne fragmenty z tłumaczenia, nazwij konstrukcję i opisz "
+                    "jej funkcję w kontekście zdania. "
+                    "Nie dopisuj konstrukcji, których nie ma w tekście. Jeśli zdanie jest proste, "
+                    "wyjaśnij jego podstawowy szyk lub formę czasownika."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Język tłumaczenia: {target_language}.\n"
+                    f"Tekst źródłowy: {source_text}\n"
+                    f"Tłumaczenie do analizy: {translated_text}"
+                ),
+            },
+        ],
+    )
+
+
 def translate_with_gpt(client, text: str, target_language: str) -> str:
     response = client.chat.completions.create(
         model=MODEL,
@@ -93,22 +133,51 @@ def correct_with_gpt(client, text: str, source_language: str) -> str:
     return (response.choices[0].message.content or "").strip()
 
 
-def translations_csv(rows) -> bytes:
+def all_work_csv(translations, learning_packs, corrections) -> bytes:
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer)
-    writer.writerow(["Język", "Tekst źródłowy", "Tłumaczenie"])
-    writer.writerows((row["language"], row["source"], row["translation"]) for row in rows)
+    writer.writerow(["Rodzaj", "Język", "Tekst / hasło", "Znaczenie / wyjaśnienie", "Przykład", "Tłumaczenie przykładu"])
+    for row in translations:
+        writer.writerow(["Tłumaczenie", row["language"], row["source"], row["translation"], "", ""])
+    for row in corrections:
+        writer.writerow(["Korekta i tłumaczenie", row["language"], row["source"], row["corrected"], row["corrected"], row["translation_pl"]])
+    for entry in learning_packs:
+        language = entry["language"]
+        pack = entry["pack"]
+        for item in pack.vocabulary:
+            writer.writerow(["Słówko", language, item.word, item.meaning_pl, item.example, item.example_pl])
+        for tip in pack.grammar_tips:
+            writer.writerow(["Gramatyka", language, tip.title, tip.explanation_pl, tip.example, tip.example_pl])
     return ("\ufeff" + buffer.getvalue()).encode("utf-8")
 
 
 st.set_page_config(page_title="Language assistant", layout="wide")
-st.title("Pomocnik językowy | Language assistant")
-st.write("Tłumacz teksty, poprawiaj błędy i poznawaj nowe słownictwo oraz gramatykę.")
+st.markdown("""
+<style>
+  .stApp { background: #fffaf5; }
+  [data-testid="stHeader"] { background: rgba(255,250,245,.92); }
+  .hero { padding: 1.1rem 1.45rem; border: 1px solid #f2c6c6; border-radius: 18px;
+    background: linear-gradient(110deg,#ffc9c9 0%,#ffec99 55%,#b2f2bb 100%); margin-bottom: 1rem; }
+  .hero h1 { margin: 0; color: #342b2b; font-size: 2rem; }
+  .hero p { margin: .3rem 0 0; color: #554747; }
+  [data-testid="stVerticalBlockBorderWrapper"] { border-color: #f0d7c5; background: rgba(255,255,255,.78); }
+  [data-testid="stBaseButton-primary"] { background: #f3aaa9; border-color: #e99a99; color: #302525; }
+  [data-testid="stBaseButton-primary"]:hover { background: #ed9292; border-color: #e48989; color: #302525; }
+  div[data-testid="stTabs"] button[role="tab"] { background: #e8f7eb; border-radius: 12px 12px 0 0; }
+  div[data-testid="stTabs"] button[aria-selected="true"] { background: #b2f2bb; color: #24362a; }
+  .section-kicker { color: #815f50; font-size: .85rem; text-transform: uppercase; letter-spacing: .08em; }
+</style>
+<div class="hero"><h1>Language assistant</h1><p>Tłumacz, poprawiaj i ucz się języków w jednym miejscu.</p></div>
+""", unsafe_allow_html=True)
 
 if "openai_api_key" not in st.session_state:
     st.session_state.openai_api_key = ""
 if "translations" not in st.session_state:
     st.session_state.translations = []
+if "learning_packs" not in st.session_state:
+    st.session_state.learning_packs = []
+if "corrections" not in st.session_state:
+    st.session_state.corrections = []
 
 with st.sidebar:
     st.header("Ustawienia API")
@@ -118,17 +187,103 @@ with st.sidebar:
 
 api_key = st.session_state.openai_api_key or dotenv_values(".env").get("OPENAI_API_KEY", "")
 languages = list(LANGUAGES)
-tab_learn, tab_translate, tab_correct = st.tabs(["Słówka i gramatyka", "Tłumacz", "Popraw tekst"])
+tab_translate, tab_exercises = st.tabs(["Tłumaczenie", "Ćwiczenia"])
 
-with tab_learn:
-    language = st.selectbox("Wybierz język docelowy:", languages, key="learning_language")
-    if st.button("Wygeneruj wyjaśnienia słów i gramatyki", key="generate_learning"):
+with tab_translate:
+    target_language = st.selectbox("Wybierz język tłumaczenia:", languages, key="translation_language")
+    input_col, history_col = st.columns([1.55, 1], gap="large")
+    with input_col:
+        st.markdown('<div class="section-kicker">Tłumaczenie tekstu</div>', unsafe_allow_html=True)
+        source_text = st.text_area("Wpisz tekst po polsku", key="translation_input", height=180, placeholder="Wpisz tekst do przetłumaczenia na wybrany język...")
+        if st.button("Tłumacz", key="translate_button", type="primary", use_container_width=True):
+            if not source_text.strip():
+                st.warning("Wpisz tekst do tłumaczenia.")
+            else:
+                try:
+                    client, _ = get_clients(api_key)
+                    with st.spinner("Tłumaczę..."):
+                        translated = translate_with_gpt(client, source_text.strip(), target_language)
+                    st.session_state.translations.append({"source": source_text.strip(), "translation": translated, "language": target_language})
+                    st.success("Tłumaczenie gotowe.")
+                except Exception as exc:
+                    st.error(f"Nie udało się przetłumaczyć tekstu: {exc}")
+
+
+        with st.container(border=True):
+            st.markdown("**Tłumacz i popraw błędy**")
+            correction_language = st.selectbox("Język tekstu obcego:", languages, key="inline_correction_language")
+            foreign_text = st.text_area("Wpisz tekst w języku obcym", key="inline_correction_input", height=120, placeholder="Tekst do korekty i tłumaczenia na polski...")
+            if st.button("Popraw błędy i przetłumacz", key="inline_correct_button", use_container_width=True):
+                if not foreign_text.strip():
+                    st.warning("Wpisz tekst do poprawy.")
+                else:
+                    try:
+                        client, _ = get_clients(api_key)
+                        with st.spinner("Poprawiam tekst i tłumaczę na polski..."):
+                            corrected = correct_with_gpt(client, foreign_text.strip(), correction_language)
+                            translation_pl = translate_with_gpt(client, corrected, "polski")
+                        correction = {"source": foreign_text.strip(), "corrected": corrected, "translation_pl": translation_pl, "language": correction_language}
+                        st.session_state.corrections.append(correction)
+                        st.session_state.corrected_text = corrected
+                        st.session_state.corrected_translation = translation_pl
+                    except Exception as exc:
+                        st.error(f"Nie udało się poprawić tekstu: {exc}")
+            if st.session_state.get("corrected_text"):
+                st.markdown(f"**Poprawiona wersja:** {st.session_state.corrected_text}")
+                st.markdown(f"**Po polsku:** {st.session_state.get('corrected_translation', '')}")
+
+    with history_col:
+        st.markdown('<div class="section-kicker">Historia tłumaczeń</div>', unsafe_allow_html=True)
+        if st.session_state.translations:
+            for index, row in enumerate(reversed(st.session_state.translations), start=1):
+                with st.container(border=True):
+                    st.caption(f"{index}. {row['language']}")
+                    st.markdown(f"**PL:** {row['source']}")
+                    st.markdown(f"**{row['language']}:** {row['translation']}")
+                    row_index = len(st.session_state.translations) - index
+                    if st.button("Wyjaśnij gramatykę", key=f"explain_grammar_{row_index}"):
+                        try:
+                            _, structured_client = get_clients(api_key)
+                            with st.spinner("Analizuję konstrukcje gramatyczne..."):
+                                explanation = explain_translation_grammar(
+                                    structured_client,
+                                    row["source"],
+                                    row["translation"],
+                                    row["language"],
+                                )
+                            row["grammar_explanation"] = explanation.model_dump()
+                        except Exception as exc:
+                            st.error(f"Nie udało się wyjaśnić gramatyki: {exc}")
+                    if row.get("grammar_explanation"):
+                        explanation = row["grammar_explanation"]
+                        st.markdown("**Wyjaśnienie gramatyczne**")
+                        st.write(explanation["overview_pl"])
+                        for construction in explanation["constructions"]:
+                            st.markdown(f"**{construction['name']}** — *{construction['fragment']}*")
+                            st.write(construction["explanation_pl"])
+        else:
+            with st.container(border=True):
+                st.write("Twoje tłumaczenia pojawią się tutaj.")
+        st.button("Generuj audio", key="generate_audio_button", disabled=True, use_container_width=True, help="Funkcja będzie dostępna w przyszłości.")
+        st.download_button(
+            "Pobierz całą pracę i tłumaczenia CSV",
+            data=all_work_csv(st.session_state.translations, st.session_state.learning_packs, st.session_state.corrections),
+            file_name="language_assistant.csv",
+            mime="text/csv; charset=utf-8",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.markdown('<div class="section-kicker">Słownictwo i gramatyka</div>', unsafe_allow_html=True)
+    language = st.selectbox("Wybierz język do nauki:", languages, key="learning_language")
+    if st.button("Wygeneruj wyjaśnienia słów i gramatyki", key="generate_learning", type="primary"):
         try:
             _, structured_client = get_clients(api_key)
             with st.spinner("Przygotowuję słówka i wskazówki gramatyczne..."):
                 pack = generate_learning_pack(structured_client, language)
             if len(pack.vocabulary) != 5:
                 raise ValueError("Model nie zwrócił dokładnie 5 haseł. Spróbuj ponownie.")
+            st.session_state.learning_packs.append({"language": language, "pack": pack})
             st.session_state.learning_pack = pack
             st.session_state.learning_language = language
         except Exception as exc:
@@ -137,68 +292,21 @@ with tab_learn:
     pack = st.session_state.get("learning_pack")
     if pack:
         st.subheader(f"Słówka: {st.session_state.learning_language}")
-        for item in pack.vocabulary:
-            with st.container(border=True):
-                st.markdown(f"**{item.word}** — {item.meaning_pl}")
-                st.markdown(f"*{item.example}*  \n{item.example_pl}")
-        st.subheader("Wskazówki gramatyczne")
-        for tip in pack.grammar_tips:
-            with st.container(border=True):
-                st.markdown(f"**{tip.title}**")
-                st.write(tip.explanation_pl)
-                st.markdown(f"*{tip.example}*  \n{tip.example_pl}")
+        words_col, grammar_col = st.columns(2, gap="large")
+        with words_col:
+            st.markdown("#### 5 słówek i przykłady użycia")
+            for item in pack.vocabulary:
+                with st.container(border=True):
+                    st.markdown(f"**{item.word}** — {item.meaning_pl}")
+                    st.markdown(f"*{item.example}*  \n{item.example_pl}")
+        with grammar_col:
+            st.markdown("#### Wskazówki gramatyczne")
+            for tip in pack.grammar_tips:
+                with st.container(border=True):
+                    st.markdown(f"**{tip.title}**")
+                    st.write(tip.explanation_pl)
+                    st.markdown(f"*{tip.example}*  \n{tip.example_pl}")
 
-with tab_translate:
-    target_language = st.selectbox("Tłumacz na:", languages, key="translation_language")
-    source_text = st.text_area("Wpisz tekst do tłumaczenia:", key="translation_input", height=160)
-    if st.button("Tłumacz", key="translate_button"):
-        if not source_text.strip():
-            st.warning("Wpisz tekst do tłumaczenia.")
-        else:
-            try:
-                client, _ = get_clients(api_key)
-                with st.spinner("Tłumaczę..."):
-                    translated = translate_with_gpt(client, source_text.strip(), target_language)
-                st.session_state.translations.append({
-                    "source": source_text.strip(), "translation": translated, "language": target_language
-                })
-                st.success("Tłumaczenie gotowe.")
-            except Exception as exc:
-                st.error(f"Nie udało się przetłumaczyć tekstu: {exc}")
 
-    if st.session_state.translations:
-        st.subheader("Historia tłumaczeń")
-        for row in reversed(st.session_state.translations):
-            with st.container(border=True):
-                st.markdown(f"**Tekst:** {row['source']}")
-                st.markdown(f"**{row['language']}:** {row['translation']}")
-        st.download_button(
-            "Pobierz tłumaczenia (CSV)",
-            data=translations_csv(st.session_state.translations),
-            file_name="tlumaczenia.csv",
-            mime="text/csv; charset=utf-8",
-        )
-
-with tab_correct:
-    source_language = st.selectbox("Język tekstu:", languages, key="correction_language")
-    text_to_correct = st.text_area("Wpisz tekst do poprawy:", key="correction_input", height=220)
-    if st.button("Popraw błędy i przetłumacz na polski", key="correct_button"):
-        if not text_to_correct.strip():
-            st.warning("Wpisz tekst do poprawy.")
-        else:
-            try:
-                client, _ = get_clients(api_key)
-                with st.spinner("Poprawiam tekst..."):
-                    corrected = correct_with_gpt(client, text_to_correct.strip(), source_language)
-                st.session_state.corrected_text = corrected
-                with st.spinner("Tłumaczę poprawiony tekst na polski..."):
-                    st.session_state.corrected_translation = translate_with_gpt(
-                        client, corrected, "polski"
-                    )
-            except Exception as exc:
-                st.error(f"Nie udało się poprawić tekstu: {exc}")
-    if st.session_state.get("corrected_text"):
-        st.subheader("Poprawiony tekst")
-        st.write(st.session_state.corrected_text)
-        st.subheader("Tłumaczenie na polski")
-        st.write(st.session_state.get("corrected_translation", ""))
+with tab_exercises:
+    pass
