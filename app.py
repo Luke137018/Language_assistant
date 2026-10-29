@@ -1,5 +1,6 @@
 import csv
 import io
+import re
 from typing import List
 
 import instructor
@@ -10,6 +11,8 @@ from pydantic import BaseModel, Field
 
 
 MODEL = "gpt-4o"
+TTS_MODEL = "tts-1"
+TTS_VOICE = "alloy"
 LANGUAGES = {
     "Angielski": "en", "Hiszpański": "es", "Niemiecki": "de",
     "Francuski": "fr", "Włoski": "it", "Portugalski (brazylijski)": "pt",
@@ -133,6 +136,29 @@ def correct_with_gpt(client, text: str, source_language: str) -> str:
     return (response.choices[0].message.content or "").strip()
 
 
+def generate_speech(client, text: str) -> bytes:
+    response = client.audio.speech.create(
+        model=TTS_MODEL,
+        voice=TTS_VOICE,
+        input=text,
+        response_format="mp3",
+    )
+    return response.content
+
+
+def render_audio_button(api_key: str, text: str, key: str, label: str = "Generuj audio") -> None:
+    cache_key = f"audio_{key}"
+    if st.button(label, key=f"generate_{key}", disabled=not text.strip()):
+        try:
+            with st.spinner("Generuję audio..."):
+                client, _ = get_clients(api_key)
+                st.session_state[cache_key] = generate_speech(client, text)
+        except Exception as exc:
+            st.error(f"Nie udało się wygenerować audio: {exc}")
+    if st.session_state.get(cache_key):
+        st.audio(st.session_state[cache_key], format="audio/mp3")
+
+
 def all_work_csv(translations, learning_packs, corrections) -> bytes:
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer)
@@ -149,6 +175,36 @@ def all_work_csv(translations, learning_packs, corrections) -> bytes:
         for tip in pack.grammar_tips:
             writer.writerow(["Gramatyka", language, tip.title, tip.explanation_pl, tip.example, tip.example_pl])
     return ("\ufeff" + buffer.getvalue()).encode("utf-8")
+
+
+def grammar_tip_text(language: str, tip: GrammarTip) -> str:
+    return (
+        f"Wyjaśnienie gramatyczne — {language}\n\n"
+        f"{tip.title}\n\n{tip.explanation_pl}\n\n"
+        f"Przykład ({language}): {tip.example}\n"
+        f"Tłumaczenie: {tip.example_pl}\n"
+    )
+
+
+def translation_grammar_text(language: str, source: str, translation: str, explanation: dict) -> str:
+    lines = [
+        f"Wyjaśnienie gramatyczne — {language}",
+        f"Tekst źródłowy: {source}",
+        f"Tłumaczenie: {translation}",
+        "",
+        explanation["overview_pl"],
+    ]
+    for construction in explanation["constructions"]:
+        lines.extend([
+            "",
+            f"{construction['name']} — {construction['fragment']}",
+            construction["explanation_pl"],
+        ])
+    return "\n".join(lines) + "\n"
+
+
+def safe_filename_part(value: str) -> str:
+    return re.sub(r"[^\w-]+", "_", value, flags=re.UNICODE).strip("_") or "jezyk"
 
 
 st.set_page_config(page_title="Language assistant", layout="wide")
@@ -241,6 +297,7 @@ with tab_translate:
                     st.markdown(f"**PL:** {row['source']}")
                     st.markdown(f"**{row['language']}:** {row['translation']}")
                     row_index = len(st.session_state.translations) - index
+                    render_audio_button(api_key, row["translation"], f"translation_{row_index}")
                     if st.button("Wyjaśnij gramatykę", key=f"explain_grammar_{row_index}"):
                         try:
                             _, structured_client = get_clients(api_key)
@@ -261,10 +318,16 @@ with tab_translate:
                         for construction in explanation["constructions"]:
                             st.markdown(f"**{construction['name']}** — *{construction['fragment']}*")
                             st.write(construction["explanation_pl"])
+                        st.download_button(
+                            "Pobierz wyjaśnienie gramatyczne",
+                            data=translation_grammar_text(row["language"], row["source"], row["translation"], explanation),
+                            file_name=f"gramatyka_{safe_filename_part(row['language'])}_{row_index + 1}.txt",
+                            mime="text/plain; charset=utf-8",
+                            key=f"download_translation_grammar_{row_index}",
+                        )
         else:
             with st.container(border=True):
                 st.write("Twoje tłumaczenia pojawią się tutaj.")
-        st.button("Generuj audio", key="generate_audio_button", disabled=True, use_container_width=True, help="Funkcja będzie dostępna w przyszłości.")
         st.download_button(
             "Pobierz całą pracę i tłumaczenia CSV",
             data=all_work_csv(st.session_state.translations, st.session_state.learning_packs, st.session_state.corrections),
@@ -274,9 +337,9 @@ with tab_translate:
         )
 
     st.markdown("---")
-    st.markdown('<div class="section-kicker">Słownictwo i gramatyka</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-kicker">Losowe słownictwo i gramatyka</div>', unsafe_allow_html=True)
     language = st.selectbox("Wybierz język do nauki:", languages, key="learning_language")
-    if st.button("Wygeneruj wyjaśnienia słów i gramatyki", key="generate_learning", type="primary"):
+    if st.button("Wygeneruj losowe wyjaśnienia słów i gramatyki", key="generate_learning", type="primary"):
         try:
             _, structured_client = get_clients(api_key)
             with st.spinner("Przygotowuję słówka i wskazówki gramatyczne..."):
@@ -291,6 +354,7 @@ with tab_translate:
 
     pack = st.session_state.get("learning_pack")
     if pack:
+        pack_index = len(st.session_state.learning_packs) - 1
         st.subheader(f"Słówka: {st.session_state.learning_language}")
         words_col, grammar_col = st.columns(2, gap="large")
         with words_col:
@@ -299,13 +363,22 @@ with tab_translate:
                 with st.container(border=True):
                     st.markdown(f"**{item.word}** — {item.meaning_pl}")
                     st.markdown(f"*{item.example}*  \n{item.example_pl}")
+                    render_audio_button(api_key, item.example, f"vocabulary_{pack_index}_{pack.vocabulary.index(item)}")
         with grammar_col:
             st.markdown("#### Wskazówki gramatyczne")
-            for tip in pack.grammar_tips:
+            for tip_index, tip in enumerate(pack.grammar_tips):
                 with st.container(border=True):
                     st.markdown(f"**{tip.title}**")
                     st.write(tip.explanation_pl)
                     st.markdown(f"*{tip.example}*  \n{tip.example_pl}")
+                    st.download_button(
+                        "Pobierz wyjaśnienie",
+                        data=grammar_tip_text(st.session_state.learning_language, tip),
+                        file_name=f"gramatyka_{safe_filename_part(st.session_state.learning_language)}_{pack_index + 1}_{tip_index + 1}.txt",
+                        mime="text/plain; charset=utf-8",
+                        key=f"download_grammar_tip_{pack_index}_{tip_index}",
+                    )
+                    render_audio_button(api_key, tip.example, f"grammar_{pack_index}_{pack.grammar_tips.index(tip)}")
 
 
 with tab_exercises:
