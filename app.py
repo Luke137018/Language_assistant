@@ -1,6 +1,8 @@
 import csv
 import io
+import json
 import re
+from pathlib import Path
 from typing import List
 
 import instructor
@@ -207,6 +209,113 @@ def safe_filename_part(value: str) -> str:
     return re.sub(r"[^\w-]+", "_", value, flags=re.UNICODE).strip("_") or "jezyk"
 
 
+DB_PATH = Path(__file__).resolve().parent / "db"
+DB_TRANSLATIONS_PATH = DB_PATH / "translations"
+DB_CURRENT_PATH = DB_PATH / "current.json"
+
+
+def ensure_translation_db() -> None:
+    DB_TRANSLATIONS_PATH.mkdir(parents=True, exist_ok=True)
+    if not DB_CURRENT_PATH.exists():
+        DB_CURRENT_PATH.write_text(json.dumps({"id": 1}, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not (DB_TRANSLATIONS_PATH / "1.json").exists():
+        save_translation_set({
+            "id": 1,
+            "name": "Mój pierwszy zbiór",
+            "translations": [],
+            "learning_packs": [],
+            "corrections": [],
+        })
+
+
+def save_translation_set(translation_set: dict) -> None:
+    DB_TRANSLATIONS_PATH.mkdir(parents=True, exist_ok=True)
+    path = DB_TRANSLATIONS_PATH / f"{translation_set['id']}.json"
+    path.write_text(json.dumps(translation_set, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def list_translation_sets() -> list[dict]:
+    ensure_translation_db()
+    result = []
+    for path in sorted(DB_TRANSLATIONS_PATH.glob("*.json"), key=lambda item: int(item.stem)):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            result.append({"id": int(data["id"]), "name": data["name"], "count": len(data.get("translations", []))})
+        except (ValueError, KeyError, json.JSONDecodeError):
+            continue
+    return result
+
+
+def load_translation_set(translation_id: int) -> dict:
+    path = DB_TRANSLATIONS_PATH / f"{translation_id}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Nie znaleziono zbioru tłumaczeń {translation_id}.")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("translations", [])
+    data.setdefault("learning_packs", [])
+    data.setdefault("corrections", [])
+    return data
+
+
+def persist_active_translation_set() -> None:
+    if "active_translation_id" not in st.session_state:
+        return
+    learning_packs = []
+    for entry in st.session_state.get("learning_packs", []):
+        pack = entry["pack"]
+        learning_packs.append({"language": entry["language"], "pack": pack.model_dump() if hasattr(pack, "model_dump") else pack})
+    current = {
+        "id": st.session_state.active_translation_id,
+        "name": st.session_state.active_translation_name,
+        "translations": st.session_state.get("translations", []),
+        "learning_packs": learning_packs,
+        "corrections": st.session_state.get("corrections", []),
+    }
+    existing = load_translation_set(current["id"])
+    for field, key_fields in (
+        ("translations", ("language", "source", "translation")),
+        ("corrections", ("language", "source")),
+    ):
+        merged = existing.get(field, [])
+        positions = {tuple(row.get(key) for key in key_fields): index for index, row in enumerate(merged)}
+        for row in current[field]:
+            key = tuple(row.get(name) for name in key_fields)
+            if key in positions:
+                merged[positions[key]] = row
+            else:
+                positions[key] = len(merged)
+                merged.append(row)
+        current[field] = merged
+    merged_packs = existing.get("learning_packs", [])
+    for entry in current["learning_packs"]:
+        if entry not in merged_packs:
+            merged_packs.append(entry)
+    current["learning_packs"] = merged_packs
+    save_translation_set(current)
+
+
+def activate_translation_set(translation_id: int) -> None:
+    data = load_translation_set(translation_id)
+    st.session_state.active_translation_id = data["id"]
+    st.session_state.active_translation_name = data["name"]
+    st.session_state.translations = data["translations"]
+    st.session_state.corrections = data["corrections"]
+    st.session_state.learning_packs = [
+        {"language": entry["language"], "pack": LearningPack.model_validate(entry["pack"])}
+        for entry in data["learning_packs"]
+    ]
+    if st.session_state.learning_packs:
+        latest = st.session_state.learning_packs[-1]
+        st.session_state.learning_pack = latest["pack"]
+        st.session_state.learning_language = latest["language"]
+    else:
+        st.session_state.pop("learning_pack", None)
+        st.session_state.pop("learning_language", None)
+
+
+ensure_translation_db()
+
+
 st.set_page_config(page_title="Language assistant", layout="wide")
 st.markdown("""
 <style>
@@ -228,6 +337,9 @@ st.markdown("""
 
 if "openai_api_key" not in st.session_state:
     st.session_state.openai_api_key = ""
+if "active_translation_id" not in st.session_state:
+    current = json.loads(DB_CURRENT_PATH.read_text(encoding="utf-8"))
+    activate_translation_set(int(current["id"]))
 if "translations" not in st.session_state:
     st.session_state.translations = []
 if "learning_packs" not in st.session_state:
@@ -236,6 +348,61 @@ if "corrections" not in st.session_state:
     st.session_state.corrections = []
 
 with st.sidebar:
+    st.header("Zbiory tłumaczeń")
+    saved_sets = list_translation_sets()
+    selected_id = st.selectbox(
+        "Historia zbiorów",
+        options=[item["id"] for item in saved_sets],
+        format_func=lambda item_id: next(
+            f"{item['name']} ({item['count']})" for item in saved_sets if item["id"] == item_id
+        ),
+        index=next((i for i, item in enumerate(saved_sets) if item["id"] == st.session_state.active_translation_id), 0),
+        key=f"translation_set_selector_{st.session_state.active_translation_id}",
+    )
+    if st.button("Wczytaj zbiór tłumaczeń", use_container_width=True):
+        activate_translation_set(selected_id)
+        DB_CURRENT_PATH.write_text(json.dumps({"id": selected_id}, indent=2), encoding="utf-8")
+        st.rerun()
+
+    if st.button("Zapisz w zbiorze", type="primary", use_container_width=True):
+        st.session_state.active_translation_id = selected_id
+        st.session_state.active_translation_name = next(item["name"] for item in saved_sets if item["id"] == selected_id)
+        persist_active_translation_set()
+        DB_CURRENT_PATH.write_text(json.dumps({"id": selected_id}, indent=2), encoding="utf-8")
+        st.success("Bieżące informacje dopisano do wybranego zbioru.")
+
+    if st.button("Usuń zbiór", use_container_width=True):
+        if len(saved_sets) == 1:
+            st.error("Nie można usunąć ostatniego zbioru. Utwórz najpierw nowy zbiór.")
+        else:
+            (DB_TRANSLATIONS_PATH / f"{selected_id}.json").unlink(missing_ok=True)
+            remaining = [item for item in saved_sets if item["id"] != selected_id]
+            next_id = remaining[0]["id"]
+            if selected_id == st.session_state.active_translation_id:
+                activate_translation_set(next_id)
+            DB_CURRENT_PATH.write_text(json.dumps({"id": st.session_state.active_translation_id}, indent=2), encoding="utf-8")
+            st.rerun()
+
+    with st.form("create_translation_set_form", clear_on_submit=True):
+        new_set_name = st.text_input("Nazwa nowego zbioru", placeholder="np. Angielski w pracy")
+        create_set = st.form_submit_button("Utwórz nowy zbiór", use_container_width=True)
+    if create_set:
+        new_id = max((item["id"] for item in saved_sets), default=0) + 1
+        save_translation_set({"id": new_id, "name": new_set_name.strip() or f"Zbiór {new_id}", "translations": [], "learning_packs": [], "corrections": []})
+        activate_translation_set(new_id)
+        DB_CURRENT_PATH.write_text(json.dumps({"id": new_id}, indent=2), encoding="utf-8")
+        st.rerun()
+
+    with st.form("rename_translation_set_form"):
+        renamed = st.text_input("Zmień nazwę aktywnego zbioru", value=st.session_state.active_translation_name)
+        rename_set = st.form_submit_button("Zapisz nazwę", use_container_width=True)
+    if rename_set and renamed.strip():
+        st.session_state.active_translation_name = renamed.strip()
+        active_data = load_translation_set(st.session_state.active_translation_id)
+        active_data["name"] = renamed.strip()
+        save_translation_set(active_data)
+        st.rerun()
+
     st.header("Ustawienia API")
     st.session_state.openai_api_key = st.text_input(
         "Podaj swój OpenAI API Key:", type="password", value=st.session_state.openai_api_key
@@ -243,7 +410,7 @@ with st.sidebar:
 
 api_key = st.session_state.openai_api_key or dotenv_values(".env").get("OPENAI_API_KEY", "")
 languages = list(LANGUAGES)
-tab_translate, tab_exercises = st.tabs(["Tłumaczenie", "Ćwiczenia"])
+tab_translate, tab_exercises = st.tabs(["Tłumaczenie", ""])
 
 with tab_translate:
     target_language = st.selectbox("Wybierz język tłumaczenia:", languages, key="translation_language")
